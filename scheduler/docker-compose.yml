@@ -1,0 +1,50 @@
+# docker run -d --name rabbitmq --network todays_news -p 5672:5672 rabbitmq
+# docker-compose up --scale crawler=3 --scale cluster=3 --scale preprocessor=3 -d
+
+version: '3.8'
+
+services:
+  crawler:
+    image: todays_news_crawler:latest
+    networks:
+      - todays_news
+    environment:
+      MQ_HOST: rabbitmq
+      MQ_QUEUE: crawler
+      DB_HOST: 192.168.0.6
+      DB_USERNAME: todays_news
+      DB_PASSWORD: 123fjscj!
+
+  cluster:
+    image: todays_news_cluster:latest
+    networks:
+      - todays_news
+    environment:
+      MQ_HOST: rabbitmq
+      MQ_QUEUE: cluster
+      DB_HOST: 192.168.0.6
+      DB_USERNAME: todays_news
+      DB_PASSWORD: 123fjscj!
+
+  preprocessor:
+    image: todays_news_preprocessor:latest
+    networks:
+      - todays_news
+    environment:
+      MQ_HOST: rabbitmq
+      MQ_QUEUE: preprocessor
+      DB_HOST: 192.168.0.6
+      DB_USERNAME: todays_news
+      DB_PASSWORD: 123fjscj!
+
+  scheduler:
+    image: today_news_scheduler:latest
+    networks:
+      - todays_news
+    environment:
+      MQ_HOST: rabbitmq
+
+networks:
+  todays_news:
+    name: todays_news
+    external: true

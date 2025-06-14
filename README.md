@@ -362,7 +362,26 @@ class MessageQueueProducer:
 이미 IPC 사이에 MQ를 사용하고 있었으므로 동일하게 스레드 사이에도 MQ로 데이터 전달이 될 것이므로 이를 이용하여 해결하였습니다.
 
 ### API 서버 성능 개선
+구현 완료된 API 서버의 성능 개선을 수행했습니다.
 
+- Entity
+  - FetchType이 Eager로 되어 있어 불필요한 조인이 발생하는 문제가 있었습니다.
+  - FetchType을 Lazy로 변경하여 단일 쿼리로 발생하도록 수정하였습니다.
+- Repository
+  - Repository에서는 JPQL의 최적화 및 DB 레벨에서의 인덱스를 생성해두었습니다.
+- Service
+  - 연관 엔티티가 필요한 비즈니스 로직임에도 불구하고 Fetch Join을 사용하고 있지 않아 N+1 문제가 발생하고 있었습니다,.
+  - Fetch Join을 적용시켜 단일 쿼리만 발생하도록 개선하였습니다.
 
 ## 화면 시안
-TODO
+### 메인 화면
+![image](https://github.com/user-attachments/assets/204408ef-c04f-4c2d-9929-0ad7ef81b33e)
+
+### 섹션 조회 화면
+![image](https://github.com/user-attachments/assets/352f856a-85ae-4d6c-801a-805de6c16660)
+
+### 클러스터 조회 화면
+![image](https://github.com/user-attachments/assets/382c881e-a383-4b5b-8313-538cd8efec19)
+
+
+

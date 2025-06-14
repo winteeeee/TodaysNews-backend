@@ -1,4 +1,4 @@
-# 오늘의 뉴스
+![image](https://github.com/user-attachments/assets/65a1c8b5-ab5d-4223-bdfb-89c3c9c6cf4f)# 오늘의 뉴스
 ## 개요
 ### 시스템의 목표
 오늘의 뉴스는 간결하고 빠른 정보 전달을 위해, 기존 기사를 후처리하여 제공하는 뉴스 플랫폼입니다.
@@ -117,9 +117,67 @@ BERTopic의 기본 사용 기술인 c-TF-IDF를 그대로 사용했습니다. Co
    - ROUGE와 RDASS 점수가 가장 높은 요약문을 선택한다면 요약문의 품질이 일정 이상 보장될 것이라 생각할 수 있습니다.
 4. 요약 메트릭의 점수가 가장 높은 요약문을 택하고 해당 뉴스의 제목과 리드를 붙여 전체 요약문으로 제시합니다.
    - 선택된 뉴스의 리드와 제목을 직접 가져다 사용하는 것이 전체 요약문의 시점에서 보았을 때 가장 자연스러운 요약문이 될 것이라 판단했습니다.
-
+  
+#### 요약문 예시
+![image](https://github.com/user-attachments/assets/fe7ec7db-f772-4eed-ab25-8d5593a1d416)
+1. 정치
+   - 김정은 북한 국무위원장과 블라디미르 푸틴 러시아 대통령 정상 회담이 공식 발표됐다. 김 위원장은 심야 또는 12일 러시아 극동 블라디보스토크에 도착해 푸틴 대통령과 회담할 것으로 예상되며 두 사람이 만나게 된다면 2019년 4월 북러 정상회담 이후 4년 5개월 만에 재회하게 된다.
+2. 경제
+   - LG가 국제박람회기구(BIE) 총회 개최지인 프랑스 파리에서 2030 세계박람회(엑스포)의 부산 유치를 홍보하는 광고에 나섰다. LG는 E 총회를 파리에서 개최하고 2030년 엑스포 개최지를 발표하게 되며 이시레몰리노 지역 인근 광고판 110개를 통해 부산엑스포 유치 홍보 활동을 펼쳤다.
+3. 사회
+   - 사기를 칠 목적으로 ‘가짜 온라인 쇼핑몰’을 운영해 총 9억원 이상을 가로챈 일당이 경찰에 붙잡혔다. 가짜 쇼핑몰 사이트로 접속을 유도한 뒤 계좌이체를 하는 수법으로 범행을 저지른 일당은 피해자에게 신뢰감을 주기 위해 타인의 신분증을 도용해 유명 쇼핑몰에 실제 TV와 냉장고 등 전자제품 판매자인 것처럼 허위 등록했다.
 
 ### 연관 문서 군집 탐색 알고리즘 개발
+![image](https://github.com/user-attachments/assets/2912ec04-b132-4645-a3e3-d10c0dbea027)
+```python
+    def find_related_cluster(self, target_cluster: Cluster, limit_date: date) -> list[Cluster]:
+        """연관 클러스터 탐색
+        주어진 클러스터와 가장 유사한 클러스터를 추출한다.
+        기준 클러스터의 임베딩과 DB에서 조회한 클러스터의 임베딩의 코사인 유사도를 측정하여 유사도 스코어를 산출한다.
+        기준 클러스터의 토픽과 DB에서 조회한 클러스터의 토픽과의 일치도를 비교하여 토픽 스코어를 산출한다.
+        두 스코어의 합을 기준으로 연관 클러스터를 판단한다.
+
+        :param target_cluster: 기준이 될 클러스터
+        :param limit_date: DB에서 조회할 날짜 제한(금일부터 limit_date까지만을 조회)
+        :return: 기준 클러스터와 가장 유사하다고 판단되는 클러스터 모델 (최대 3개)
+        """
+        duration: tuple[date, datetime] = (limit_date, target_cluster.regdate - timedelta(days=1))
+        preprocessed_target: PreprocessedCluster = self._preprocessed_cluster_repository.find_all_by_cluster(target_cluster)[0]
+        clusters: list[Cluster] = self._cluster_repository.find_all_by_section_id_and_duration(section_id=target_cluster.section_id,
+                                                                                               duration=duration)
+        preprocessed_clusters: list[PreprocessedCluster] = self._preprocessed_cluster_repository.find_all_by_cluster(clusters=clusters)
+        relational_clusters: list[tuple[float, Cluster]] = []
+
+        for cluster, preprocessed_cluster in zip(clusters, preprocessed_clusters):
+            embedding = preprocessed_cluster.embedding
+            words = preprocessed_cluster.words
+            sim_score: float = self._cal_cos_sim(preprocessed_target.embedding, embedding)
+            topic_score: int = self._is_matching(preprocessed_target.words, words)
+            # topic_score의 최대치는 3, sim_score의 최대치는 1이므로 sim_score에 3 가중치 설정
+
+            relational_clusters.append((sim_score * 3 + topic_score, cluster))
+
+        relational_clusters = sorted(relational_clusters, key=lambda x: x[0], reverse=True)
+        result_list: list[Cluster] = []
+        for idx, element in enumerate(relational_clusters):
+            if idx == self.MAX_OF_RELATIONAL:
+                break
+
+            score, cluster = element
+            if score > self._threshold:
+                result_list.append(cluster)
+
+        return result_list
+```
+
+식별된 뉴스 군집과 가장 유사한 군집을 찾아냅니다.
+
+현재 군집과 유사한 군집이 가질 수 있는 특징은 아래와 같다고 생각했습니다.
+
+비슷한 주제를 다룰 것이므로 임베딩의 코사인 유사도가 유사할 것이다.
+비슷한 토픽이 뽑혔을 가능성이 높다.
+
+따라서 위 두 가지 척도를 기반으로 특정 기간 내에 생성된 뉴스 군집을 대상으로 코사인 유사도 점수와 토픽 일치 점수를 뽑아 최상위 3개의 뉴스 군집을 추출하였습니다.
 
 ### 뉴스 전처리 아키텍처 개선
 

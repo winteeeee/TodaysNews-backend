@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/65a1c8b5-ab5d-4223-bdfb-89c3c9c6cf4f)# 오늘의 뉴스
+# 오늘의 뉴스
 ## 개요
 ### 시스템의 목표
 오늘의 뉴스는 간결하고 빠른 정보 전달을 위해, 기존 기사를 후처리하여 제공하는 뉴스 플랫폼입니다.

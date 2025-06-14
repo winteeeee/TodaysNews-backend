@@ -180,6 +180,186 @@ BERTopic의 기본 사용 기술인 c-TF-IDF를 그대로 사용했습니다. Co
 따라서 위 두 가지 척도를 기반으로 특정 기간 내에 생성된 뉴스 군집을 대상으로 코사인 유사도 점수와 토픽 일치 점수를 뽑아 최상위 3개의 뉴스 군집을 추출하였습니다.
 
 ### 뉴스 전처리 아키텍처 개선
+최초로 개발되었을 때 Crawler, Preprocessor, Cluster, Scheduler가 모두 하나로 합쳐져 있는 상태였습니다.
+
+그에 따라 아래와 같은 문제점이 발생했습니다.
+
+- 확장성 부족
+  - 단 하나의 Worker 내부에서 멀티프로세스로 모듈들이 동작 중인 상태
+  - 작업의 병렬성이 없어 Worker를 늘리기 어려움
+- 느린 작업 속도
+  - 모든 로직이 순차적으로 수행되므로 Scale-out에 따른 작업 속도 증가를 볼 수 없음
+- 단일 장애 지점
+  - Worker를 다중으로 배치할 수 없으니 단일 장애 지점화
+- 재시도 로직 부재
+  - Worker에서 수행되는 작업은 오랜 시간이 걸리는 무거운 작업들이 대부분
+  - 기타 사유로 작업이 실패하거나 서버가 죽을 경우 해당 Worker가 맡고 있는 작업 자체가 유실
+
+#### 작업 병렬화
+느린 작업 속도, 단일 장애 지점은 결국 Worker의 확장성이 매우 크게 떨어지는 상태이기 때문에 발생하는 문제입니다. 그리고 Worker의 확장성이 떨어지는 이유는 수행하는 작업이 병렬적으로 수행될 수가 없는 상태였기 때문입니다.
+
+따라서 가장 먼저 해결해야할 과제는 작업을 병렬화 시키는 것라고 생각했습니다.
+
+또한 각 모듈을 분리하였습니다. 이를 통해 각 기능에 맞춰 독립적인 확장이 가능해지고, 서비스 사이의 의존성을 낮출 수 있을 것이라고 생각했습니다.
+
+```python
+# Crawler Worker
+    def crawling(self, t_date: date) -> (list, list):
+        article_list = []
+        
+        # self.conf['CODE']에 전체 언론사 정보가 담겨있다
+        # 결론적으로 전체 언론사에 대한 크롤링을 수행하는 구조
+        for press in self.conf['CODE']:
+            code = self.conf['CODE'][press]
+
+            self.logger.debug(str(press) + ' crawling start..')
+            news_url_list = self.get_updated_url_list(code, t_date)
+            cur_article_list = self.get_news_list(news_url_list, press)
+            article_list += cur_article_list
+
+        return article_list
+
+->
+
+	# 크롤링을 수행할 언론사를 외부에서 주입받게 변경
+    def _crawling(self, t_date: date, press: str) -> (list, list):
+        article_list = []
+
+        code = self.conf['CODE'][press]
+        self.logger.debug(str(press) + ' crawling start..')
+        news_url_list = self.get_updated_url_list(code, t_date)
+        cur_article_list = self.get_news_list(news_url_list, press)
+        article_list += cur_article_list
+
+        return article_list
+```
+하나의 Crawler 프로세스가 전체 언론사에 대한 뉴스를 크롤링 하는 것이 아닌 특정 한 언론사에 대한 크롤링을 담당하도록 하여 병렬적으로 여러 언론사의 기사를 크롤링할 수 있도록 변경하였습니다.
+
+```python
+# Cluster
+
+# 모든 섹션을 대상으로 차례대로 클러스터링 수행
+for section_name in self.section_id.keys():
+	self._clustering(section_name, t_date)
+
+->
+
+self._clustering(section_name, t_date)
+```
+클러스터링 역시 전체 섹션이 아닌 한 섹션에 대해 수행하도록 변경하여 여러 Cluster Worker에 배치되면 클러스터링의 속도 또한 빨라질 수 있도록 하였습니다.
+
+또한, Crawler와 Cluster에는 크롤링, 클러스터에 대한 로직 뿐만 아니라 뉴스의 전처리에 대한 로직이 혼재되어 있었습니다. 이는 단일 책임 원칙을 위반하여 유지보수성을 떨어뜨린다고 판단하여  preprocessor라는 별도의 모듈로 분리하였습니다.
+
+#### 메시지 큐 도입
+이전 단계에서 각 모듈들을 분리해냈습니다. 각 모듈은 스케줄러로부터 작업을 수행하라는 명령을 받아야 하고, 또 전처리 로직의 경우 크롤러와 클러스터와의 통신이 필요했습니다.
+
+모듈 간의 통신은 HTTP를 이용한 API 호출과 메시지 큐 정도로 구현할 수 있을텐데 MQ를 사용하면 재시도 로직까지 같이 구현할 수 있으므로 MQ를 채택했습니다.
+
+#### RabbitMQ 관련 트러블슈팅
+```python
+class MessageQueueConsumer:
+    def __init__(self, task_callback):
+        self.host = os.getenv('MQ_HOST', 'localhost')
+        self.queue = os.getenv('MQ_QUEUE', 'crawler')
+        self.logger = get_logger('MessageQueueConsumer')
+        self.task_callback = task_callback
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.host))
+        self.channel = self.connection.channel()
+        self.channel.queue_declare(queue=self.queue, durable=True)
+        self.channel.basic_qos(prefetch_count=1)
+        self.channel.basic_consume(queue=self.queue, on_message_callback=self.callback)
+
+    def start(self):
+        self.logger.info('waiting message')
+        self.channel.start_consuming()
+
+    def _send_heartbeat(self):
+        interval = 30
+        if self.connection.is_open:
+            self.connection.process_data_events(time_limit=interval)
+
+    def callback(self, ch, method, properties, body):
+        try:
+            data = body.decode('utf-8')
+        except UnicodeDecodeError:
+            data = pickle.loads(body)
+
+        self.logger.info(f"Task Request - {data}")
+        task_thread = threading.Thread(target=self.task_callback, args=(data,), daemon=True)
+        task_thread.start()
+        while task_thread.is_alive():
+            self._send_heartbeat()
+        self.logger.info(f"Task Done - {data}")
+        # 작업 완료 ACK 전송
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+```
+MQ로부터 메세지를 수신하고 작업을 수행하는 컨슈머 클래스입니다.
+
+큐를 정의할 때 durable을 True로 줌으로서 MQ 자체의 장애에 대한 고려를 해주었습니다. basic_qos의 prefetch_count는 1로 설정하였는데, 각 워커의 작업의 수행시간이 매우 길기 때문에 1개를 초과하는 메세지를 수신했을 때의 이점이 없다고 생각했기 때문입니다.
+
+생성자로 큐의 메세지를 수신받았을 때 수행할 콜백 함수를 받은 후 실제로 메세지를 수신받을 경우 해당 콜백 함수를 실행하는 구조입니다.
+
+구현하고 테스트하는 도중 문제가 하나 발생했습니다. MQ와 연결된 커넥션은 주기적으로 하트비트를 보내주지 않으면 MQ 측에서 해당 서버에 문제가 발생했다고 판단하여 연결을 끊어버리는 것으로, 현재 시스템의 각 모듈이 담당하고 있는 로직은 모두 상당히 오랜 시간이 걸리는 작업이었기 때문에 이를 반드시 해결할 필요가 있었습니다.
+
+- 대안 1. 작업이 완료될 때마다 새로운 커넥션 만들기
+  - 일단 문제는 해결됩니다. 하지만 매번 네트워크 커넥션을 수립하는 것부터가 불필요하고 큰 오버헤드기 때문에 가능한 이 방안은 피하고 싶었습니다.
+- 대안 2. 콜백 함수를 수행하는 동시에 멀티스레드로 하트비트를 송신하기
+  - 그럴듯해 보였습니다. 하지만 의도한대로 동작하지 않고 다른 에러가 발생했습니다.
+  - RabbitMQ는 스레드 당 하나의 커넥션을 유지시키기 때문에 다른 스레드에서는 접근이 불가능하기 때문에 발생하는 문제였습니다. 따라서 대안 2는 선택할 수 없었습니다.
+- 대안 3. 콜백 함수를 멀티스레드로 수행하고 메인 스레드에서 하트비트를 송신하기
+  - 그럼 반대로 콜백 함수를 멀티스레드로 수행하고 메인 스레드에서 하트비트를 송신하면 되지 않을까? 하는 생각에 다다랐고 정상적인 실행이 되었기 때문에 이를 채택했습니다.
+  - 현재 시스템에서 수행하는 작업은 I/O Bound 작업이 대부분이라 파이썬의 GIL를 고려하여도 멀티스레드가 프로세스에 비해 이점이 있다고 판단하였습니다.
+
+```python
+class MessageQueueProducer:
+    def __init__(self, target_queue: str, message_queue:queue.Queue):
+        self.host = os.getenv('MQ_HOST', 'localhost')
+        self.target_queue = target_queue
+        self.message_queue = message_queue
+        self.logger = get_logger('MessageQueueProducer')
+        self.connection = None
+        self.channel = None
+
+    def start(self):
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.host))
+        self.channel = self.connection.channel()
+        self.channel.queue_declare(queue=self.target_queue, durable=True)
+
+        while True:
+            if not self.message_queue.empty():
+                message, need_dump = self.message_queue.get()
+                self.send(message, need_dump=need_dump)
+            else:
+                self._send_heartbeat()
+
+    def _send_heartbeat(self):
+        interval = 30
+        if self.connection.is_open:
+            self.connection.process_data_events(time_limit=interval)
+
+    def send(self, data, need_dump=False):
+        self.logger.debug(f'sending {data}')
+        if need_dump:
+            data = pickle.dumps(data)
+
+        self.channel.basic_publish(
+            exchange='',
+            routing_key=self.target_queue,
+            body=data,
+            properties=pika.BasicProperties(
+                delivery_mode=pika.DeliveryMode.Persistent
+            )
+        )
+```
+이번에는 MQ와 연결되어 메세지를 생성하는 프로듀서 클래스입니다.
+
+이는 전체 작업을 총괄하는 스케줄러가 사용하기도 하지만 크롤러와 클러스터의 작업 이후에 전처리 워커와 통신하는데도 사용됩니다.
+
+스케줄러의 경우 주기적으로 메세지를 보내기만 하고 다른 작업을 수행하지 않기 때문에 문제가 없지만 크롤러의 경우 컨슈머와 마찬가지의 이유로 크롤링이 끝난 뒤 MQ에 메세지를 생성하려고 보면 커넥션이 끊어져 있는 문제가 발생했습니다.
+
+컨슈머에서 해결한 것과 같이 메인 스레드에서 하트비트를 보내는 방향으로 생각했지만 이쪽은 생각할 부분이 더 있었습니다. 동적으로 데이터를 수신받아 MQ에 보내줘야 하기 때문에 스레드 간 데이터를 공유할 방법을 고안해야했다.
+
+이미 IPC 사이에 MQ를 사용하고 있었으므로 동일하게 스레드 사이에도 MQ로 데이터 전달이 될 것이므로 이를 이용하여 해결하였습니다.
 
 ### API 서버 성능 개선
 
